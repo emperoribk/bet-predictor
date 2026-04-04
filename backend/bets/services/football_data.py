@@ -2059,6 +2059,37 @@ def _get_team_stats_from_db(
             if u_h_n: home_xg_pg  = round(u_h_xg / u_h_n, 2)
             if u_a_n: away_xg_pg  = round(u_a_xg / u_a_n, 2)
 
+    # ── Recent xG conversion (last 5 games with xG data) ─────────────────────
+    # Tracks whether the team is actually converting their expected goals lately.
+    # A ratio < 0.65 means they're scoring well below what their xG predicts —
+    # the scoring-probability discount in _calc_team_goal_lines uses this.
+    _xg_by_fid: dict = {}
+    _UNDERSTAT_CODES_LOCAL = {"PL", "PD", "BL1", "SA", "FL1"}
+    for m in matches:
+        is_home_m = m["home_team_id"] == team_id
+        fid = m["id"]
+        if competition_code in _UNDERSTAT_CODES_LOCAL and fid in us_by_fid:
+            us = us_by_fid[fid]
+            _xg_by_fid[fid] = us["xg_h"] if is_home_m else us["xg_a"]
+        elif fid in ms_by_fid:
+            ms_r = ms_by_fid[fid]
+            if ms_r.get("xg_home") is not None:
+                _xg_by_fid[fid] = ms_r["xg_home"] if is_home_m else ms_r["xg_away"]
+
+    _recent_gf, _recent_xg = [], []
+    for m in matches[:5]:
+        xg_v = _xg_by_fid.get(m["id"])
+        if xg_v is not None:
+            is_home_m = m["home_team_id"] == team_id
+            _recent_gf.append(m["home_score"] if is_home_m else m["away_score"])
+            _recent_xg.append(xg_v)
+
+    xg_conversion_last5 = (
+        round(sum(_recent_gf) / sum(_recent_xg), 3)
+        if _recent_xg and sum(_recent_xg) > 0.5
+        else None
+    )
+
     # ── Standings ─────────────────────────────────────────────────────────────
     all_standings = _get_league_standings_from_db(competition_code, season, match_date_str)
     standing = all_standings.get(team_id, {})
@@ -2109,6 +2140,7 @@ def _get_team_stats_from_db(
 
         "yellow_cards_pg": yellow_cards_pg,
         "competition_code": competition_code,
+        "xg_conversion_last5": xg_conversion_last5,
     }
 
     # xG overperformance ratio

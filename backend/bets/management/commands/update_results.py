@@ -38,8 +38,42 @@ def _sim(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
 
 
+def _fetch_results_from_db(match_date: str) -> list[dict] | None:
+    """Fetch match results from local HistoricalFixture table (fast, no API calls)."""
+    try:
+        from bets.models import HistoricalFixture
+        rows = HistoricalFixture.objects.filter(
+            match_date=match_date,
+            home_score__isnull=False,
+            away_score__isnull=False,
+        ).values("home_team", "away_team", "home_score", "away_score", "league_code")
+        if rows.exists():
+            return [
+                {
+                    "home_team":   r["home_team"],
+                    "away_team":   r["away_team"],
+                    "home_score":  r["home_score"],
+                    "away_score":  r["away_score"],
+                    "league_code": r["league_code"],
+                }
+                for r in rows
+            ]
+    except Exception:
+        pass
+    return None
+
+
 def _fetch_results(match_date: str) -> list[dict]:
-    """Fetch all finished matches from football-data.org for a given date."""
+    """Fetch all finished matches — DB first, live API fallback."""
+    from datetime import date as _date_cls
+    try:
+        if _date_cls.fromisoformat(match_date) < _date_cls.today():
+            db = _fetch_results_from_db(match_date)
+            if db:
+                return db
+    except Exception:
+        pass
+
     results = []
     for code in COMP_CODES:
         try:
@@ -98,8 +132,14 @@ def _evaluate(pred: Prediction, home_score: int, away_score: int) -> str:
         return "WIN" if total > 1 else "LOSS"
     if "over 0.5" in bet:
         return "WIN" if total > 0 else "LOSS"
+    if "over 3.5" in bet:
+        return "WIN" if total > 3 else "LOSS"
     if "btts" in bet or "both teams to score" in bet:
         return "WIN" if home_score > 0 and away_score > 0 else "LOSS"
+
+    # "Either Team to Win (12)" — market wins if either side wins (no draw)
+    if "12" in bet or "either team to win" in bet:
+        return "WIN" if home_score != away_score else "LOSS"
 
     # "Team X to Score 1+"
     if "to score 1+" in bet:
@@ -111,15 +151,32 @@ def _evaluate(pred: Prediction, home_score: int, away_score: int) -> str:
         else:
             return "WIN" if away_score > 0 else "LOSS"
 
+    # "Team X Clean Sheet" — team doesn't concede
+    if "clean sheet" in bet:
+        team = bet.replace("clean sheet", "").strip()
+        if _sim(team, pred.home_team.lower()) > _sim(team, pred.away_team.lower()):
+            return "WIN" if away_score == 0 else "LOSS"
+        else:
+            return "WIN" if home_score == 0 else "LOSS"
+
+    # "Cards Over X.5"
+    if "cards over" in bet:
+        import re
+        m = re.search(r"cards over (\d+\.?\d*)", bet)
+        if m:
+            threshold = float(m.group(1))
+            total_cards = (pred.raw_data or {}).get("total_cards", None)
+            if total_cards is not None:
+                return "WIN" if total_cards > threshold else "LOSS"
+        return "VOID"  # can't verify without card data
+
     # Double-chance markets:
-    #   "Team or Draw (1X)"  → home team doesn't lose  ("or draw" after team)
-    #   "Draw or Team (X2)"  → away team doesn't lose  ("draw or" before team)
+    #   "Team or Draw (1X)"  → home team doesn't lose
+    #   "Draw or Team (X2)"  → away team doesn't lose
     if "or draw" in bet or "draw or" in bet or "1x" in bet or "x2" in bet:
         if "x2" in bet or "draw or" in bet:
-            # Away team or draw
             return "WIN" if away_score >= home_score else "LOSS"
         else:
-            # Home team or draw (1X)
             return "WIN" if home_score >= away_score else "LOSS"
 
     # Win market "Team X to Win"

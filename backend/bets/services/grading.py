@@ -285,6 +285,31 @@ def _apply_penalties(
                 f"are elite away — can outperform Poisson probability (-5)"
             )
 
+    # 3b. Hot home team on X2 DC — mirror of the above.
+    # When the home team is in strong recent form (won 2+ of last 3) AND ranks in the
+    # top half of the table, the Poisson model underweights their current momentum.
+    # Example: Aston Villa (6W from last 7) was fully in form but Arsenal X2 was backed.
+    if signal.get("type") == "DOUBLE_CHANCE_X2":
+        h_pos       = home.get("position")
+        h_scored3   = home.get("scored_last3")   # goals scored in last 3 games
+        h_xg_home   = home.get("home_xg_pg") or home.get("xg_per_game") or 0
+        h_cs3       = home.get("cs_last3")        # clean sheets in last 3
+        # Hot home team: top-half position, scoring well, and in form
+        if (h_pos and h_pos <= 10 and h_xg_home > 1.3
+                and h_scored3 is not None and h_scored3 >= 3):
+            deductions += 5
+            notes.append(
+                f"⚠ {home.get('team_name', 'Home team')} (pos {h_pos}, scored in all 3 recent games) "
+                f"are in strong home form — X2 underweights their momentum (-5)"
+            )
+        # Also penalise if home team has been keeping clean sheets (hard to break down)
+        if h_cs3 is not None and h_cs3 >= 2 and h_xg_home > 1.2:
+            deductions += 3
+            notes.append(
+                f"⚠ {home.get('team_name', 'Home team')} kept {h_cs3} clean sheets in last 3 "
+                f"— tight defence at home increases upset risk (-3)"
+            )
+
     # 4. Conflicting xG vs actual goals scored
     h_xg = home.get("xg_per_game") or 0
     h_scored = home.get("scored_per_game") or 0

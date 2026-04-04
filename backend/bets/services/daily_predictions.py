@@ -766,6 +766,7 @@ def _calc_double_chance(home: dict, away: dict) -> list[dict]:
             "signal": "yes" if conf >= 60 else ("lean_yes" if conf >= 53 else ("lean_no" if conf >= 47 else "no")),
             "evidence": list(evidence),
             "probability": round(prob, 4),
+            "draw_prob":   round(p_draw, 4),   # always store so callers can apply low-draw rule
         }
 
     results = [
@@ -776,23 +777,31 @@ def _calc_double_chance(home: dict, away: dict) -> list[dict]:
 
     # Stalemate-protection boost: when both defences are tight and one team is
     # clearly dominant, the dominant team's DC (covers even a 0-0) should rank
-    # above Over 0.5. Boost that DC by up to +12 confidence points.
+    # above Over 0.5. Boost that DC by up to +5 confidence points.
+    #
+    # NOTE: the original +12 boost was too aggressive — it inflated picks with
+    # raw Poisson probability ~76% up to 88-89% confidence, masking the true
+    # uncertainty. Capped at +5 so the displayed confidence stays honest.
+    # Additionally, enforce a hard cap: boosted confidence cannot exceed
+    # raw_prob * 100 + 5, preventing grade inflation on marginal picks.
     h_cs = home.get("home_cs_rate") or home.get("clean_sheet_rate") or 0.0
     a_cs = away.get("away_cs_rate") or away.get("clean_sheet_rate") or 0.0
     xg_gap = h_xg - a_xg
     if h_cs >= 0.30 and a_cs >= 0.30:
         if xg_gap >= 0.25:
             # Home team is dominant — boost 1X
-            boost = 12 if xg_gap >= 0.55 else 8
-            results[0]["confidence"] = min(99, results[0]["confidence"] + boost)
+            boost = 5 if xg_gap >= 0.55 else 3
+            raw_cap = int((p_home + p_draw) * 100) + 5
+            results[0]["confidence"] = min(raw_cap, results[0]["confidence"] + boost)
             results[0]["evidence"].append(
                 f"Stalemate protection: both defences tight (H CS {h_cs:.0%} / A CS {a_cs:.0%}), "
                 f"home dominant (+{boost} xG gap {xg_gap:.2f}) — 1X covers 0-0"
             )
         elif xg_gap <= -0.25:
             # Away team is dominant — boost X2
-            boost = 12 if xg_gap <= -0.55 else 8
-            results[1]["confidence"] = min(99, results[1]["confidence"] + boost)
+            boost = 5 if xg_gap <= -0.55 else 3
+            raw_cap = int((p_draw + p_away) * 100) + 5
+            results[1]["confidence"] = min(raw_cap, results[1]["confidence"] + boost)
             results[1]["evidence"].append(
                 f"Stalemate protection: both defences tight (H CS {h_cs:.0%} / A CS {a_cs:.0%}), "
                 f"away dominant (+{boost} xG gap {abs(xg_gap):.2f}) — X2 covers 0-0"
@@ -942,6 +951,33 @@ def _calc_team_goal_lines(home: dict, away: dict) -> list[dict]:
     if h_blank_rate >= 0.15:
         h_form_mult *= 0.88
         h_form_note = (h_form_note + f"; blanks at home {h_blank_rate:.0%} of games").lstrip("; ")
+
+    # xG conversion discount — penalise teams that consistently fail to convert xG.
+    # Uses last-5-game ratio first, falls back to season ratio.
+    # Catches repeat offenders like Monaco, Lausanne, AZ that blank despite high xG.
+    def _xg_conv_mult(stats):
+        conv = stats.get("xg_conversion_last5") or stats.get("xg_overperform_ratio")
+        if conv is None:
+            return 1.0, ""
+        if conv < 0.45:
+            return 0.75, (
+                f"xG conversion only {conv:.2f}x in recent games "
+                f"— severely failing to score despite chances"
+            )
+        if conv < 0.65:
+            return 0.87, (
+                f"xG conversion {conv:.2f}x — consistently scoring below expected goals"
+            )
+        return 1.0, ""
+
+    h_conv_mult, h_conv_note = _xg_conv_mult(home)
+    a_conv_mult, a_conv_note = _xg_conv_mult(away)
+    h_form_mult *= h_conv_mult
+    a_form_mult *= a_conv_mult
+    if h_conv_note:
+        h_form_note = (h_form_note + f"; {h_conv_note}").lstrip("; ")
+    if a_conv_note:
+        a_form_note = (a_form_note + f"; {a_conv_note}").lstrip("; ")
 
     ev_home = [f"{home['team_name']} expected {h_xg:.2f} xG at home"]
     if h_form_note:
@@ -1498,9 +1534,9 @@ def get_all_bet_signals(
     # ── Team goal lines ────────────────────────────────────────────────────────
     raw.extend(_calc_team_goal_lines(home_stats, away_stats))
 
-    # ── Clean sheets ──────────────────────────────────────────────────────────
-    raw.append(_calc_home_clean_sheet(home_stats, away_stats))
-    raw.append(_calc_away_clean_sheet(home_stats, away_stats))
+    # ── Clean sheets — DISABLED (66% loss rate; historical CS% is noise, not signal)
+    # raw.append(_calc_home_clean_sheet(home_stats, away_stats))
+    # raw.append(_calc_away_clean_sheet(home_stats, away_stats))
 
     # ── Half markets ──────────────────────────────────────────────────────────
     raw.append(_calc_goal_in_both_halves(home_stats, away_stats))
@@ -1526,6 +1562,22 @@ def get_all_bet_signals(
 
     # ── Grade every signal ─────────────────────────────────────────────────────
     graded = grade_all_signals(positive, home_stats, away_stats, home_context, away_context)
+
+    # ── Small-sample confidence cap ────────────────────────────────────────────
+    # Previously, small-sample warnings were cosmetic — they appeared in the
+    # output but had zero effect on whether a pick was selected. The confidence
+    # stayed at 90%+ even with 2 games of data, and 7 of 8 early-season losses
+    # had this warning. Now we enforce hard caps so the threshold filter does
+    # the right thing: early-season picks can only fire if the raw signal is
+    # genuinely extreme.
+    #   < 5 games  → cap confidence at 80%  (never reaches 85% threshold)
+    #   < 8 games  → cap confidence at 86%  (only very strong signals pass)
+    _min_played = min(home_stats.get("played") or 0, away_stats.get("played") or 0)
+    if _min_played < 8:
+        _conf_cap = 80 if _min_played < 5 else 86
+        for s in graded:
+            if s.get("confidence", 0) > _conf_cap:
+                s["confidence"] = _conf_cap
 
     # ── Over-confirmation filter ───────────────────────────────────────────────
     # A lower over tier is only picked when the next tier up ALSO grades > 75.
@@ -1567,6 +1619,51 @@ def get_all_bet_signals(
             _drought_drop.add("AWAY_TEAM_OVER_05")
             print(f"[Drought] {away_stats.get('team_name')} scored in 0 of last 3 — AWAY_TEAM_OVER_05 blocked")
         graded = [s for s in graded if s["type"] not in _drought_drop]
+
+    # ── Repeat blank blocker ──────────────────────────────────────────────────
+    # If a team scored 0 goals in 2+ of their last 6 actual fixtures (from
+    # HistoricalFixture), they are a chronic chance-misser. Block their
+    # "to Score 1+" pick regardless of what xG says.
+    # Uses actual match results (not Prediction outcomes) so it works in both
+    # live and backtest mode — the DB always has real scores.
+    try:
+        from bets.models import HistoricalFixture as _HF
+        from django.db.models import Q as _Q
+
+        def _is_chronic_blank(team_id: int, match_date_str: str) -> bool:
+            """True if team scored 0 in 2+ of last 6 games (by actual result)."""
+            qs = _HF.objects.filter(
+                _Q(home_team_id=team_id) | _Q(away_team_id=team_id),
+                match_date__lt=match_date_str,
+                home_score__isnull=False,
+            ).order_by("-match_date")[:6]
+            blanks = 0
+            for f in qs:
+                is_h = f.home_team_id == team_id
+                scored = f.home_score if is_h else f.away_score
+                if scored == 0:
+                    blanks += 1
+            return blanks >= 2
+
+        _h_id = home_stats.get("team_id")
+        _a_id = away_stats.get("team_id")
+        from datetime import date as _date_cls
+        _match_dt = str(_date_cls.today())
+
+        _repeat_drop = set()
+        h_name = home_stats.get("team_name", "")
+        a_name = away_stats.get("team_name", "")
+
+        if _h_id and _is_chronic_blank(_h_id, _match_dt):
+            _repeat_drop.add("HOME_TEAM_OVER_05")
+            print(f"[RepeatBlank] {h_name} scored 0 in 2+ of last 6 — HOME_TEAM_OVER_05 blocked")
+        if _a_id and _is_chronic_blank(_a_id, _match_dt):
+            _repeat_drop.add("AWAY_TEAM_OVER_05")
+            print(f"[RepeatBlank] {a_name} scored 0 in 2+ of last 6 — AWAY_TEAM_OVER_05 blocked")
+        if _repeat_drop:
+            graded = [s for s in graded if s["type"] not in _repeat_drop]
+    except Exception:
+        pass  # non-fatal
 
     # ── P(0-0) block ───────────────────────────────────────────────────────────
     # If the Poisson model gives >15% probability of a goalless game, every
