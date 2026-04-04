@@ -398,6 +398,42 @@ def _fetch_competition_for_date(code: str, date_str: str) -> tuple[list[dict], b
         return [], True, False  # Network failure
 
 
+def _get_fixtures_from_db(date_str: str) -> list[dict] | None:
+    """
+    Fetch fixtures for a given date from the local HistoricalFixture table.
+    Returns a list in the same format as get_fixtures_by_date(), or None if
+    no records exist for that date (fall through to live API).
+    """
+    try:
+        from bets.models import HistoricalFixture
+        rows = list(HistoricalFixture.objects.filter(
+            match_date=date_str,
+        ).values(
+            "home_team", "away_team", "home_team_id", "away_team_id",
+            "league_code", "league_name", "kickoff", "home_score", "away_score",
+        ))
+        if not rows:
+            return None
+        result = []
+        for r in rows:
+            result.append({
+                "home_team":      r["home_team"],
+                "away_team":      r["away_team"],
+                "home_team_id":   r["home_team_id"],
+                "away_team_id":   r["away_team_id"],
+                "competition_code": r["league_code"],
+                "competition":    r["league_name"],
+                "area":           "",
+                "kickoff":        r["kickoff"].isoformat() if r["kickoff"] else "",
+                "status":         "FINISHED",
+                "home_score":     r["home_score"],
+                "away_score":     r["away_score"],
+            })
+        return result
+    except Exception:
+        return None
+
+
 def get_fixtures_by_date(date_str: str) -> list[dict]:
     """
     Fetches every match on a specific date (YYYY-MM-DD) by querying each
@@ -412,6 +448,18 @@ def get_fixtures_by_date(date_str: str) -> list[dict]:
         ts, data = cached
         if now - ts < _FIXTURES_DATE_TTL:
             return data
+
+    # ── Try local DB first (historical dates) ────────────────────────────────
+    from datetime import date as _date_cls
+    try:
+        _pred_date = _date_cls.fromisoformat(date_str)
+        if _pred_date < _date_cls.today():
+            db_fixtures = _get_fixtures_from_db(date_str)
+            if db_fixtures is not None:
+                _fixtures_date_cache[date_str] = (now, db_fixtures)
+                return db_fixtures
+    except Exception:
+        pass
 
     codes = _get_competition_codes()
     all_matches: list[dict] = []
@@ -1142,6 +1190,28 @@ def _get_team_recent_results(team_id: int, limit: int = 10) -> list[str]:
         if now - ts < _FORM_TTL:
             return data
 
+    # Try DB first
+    try:
+        from bets.models import HistoricalFixture
+        from django.db.models import Q
+        db_matches = list(HistoricalFixture.objects.filter(
+            Q(home_team_id=team_id) | Q(away_team_id=team_id),
+            home_score__isnull=False,
+        ).order_by("-match_date").values(
+            "home_team_id", "home_score", "away_score"
+        )[:limit])
+        if db_matches:
+            results = []
+            for m in db_matches:
+                is_home = m["home_team_id"] == team_id
+                gf = m["home_score"] if is_home else m["away_score"]
+                ga = m["away_score"] if is_home else m["home_score"]
+                results.append("W" if gf > ga else ("D" if gf == ga else "L"))
+            _form_cache[cache_key] = (now, results)
+            return results
+    except Exception:
+        pass
+
     try:
         resp = requests.get(
             f"{BASE_URL}/teams/{team_id}/matches",
@@ -1170,15 +1240,19 @@ def _get_team_recent_results(team_id: int, limit: int = 10) -> list[str]:
     return results
 
 
-def get_team_context(team_id: int, competition_code: str) -> dict:
+def get_team_context(team_id: int, competition_code: str, match_date: str | None = None) -> dict:
     """
     Returns full context for a team:
       - League standings position, points, gaps
       - Winning/losing streak
       - Motivation tier
     Used by the player assessment engine.
+    Pass match_date to use DB standings (no API call) for historical dates.
     """
-    standings = _get_standings(competition_code)
+    if match_date:
+        standings = _get_league_standings_from_db(competition_code, 2025, match_date)
+    else:
+        standings = _get_standings(competition_code)
     standing  = standings.get(team_id, {})
 
     recent    = _get_team_recent_results(team_id, limit=20)
@@ -1482,6 +1556,51 @@ def get_h2h_scored(home_team_id: int, away_team_id: int) -> dict:
     if not home_team_id or not away_team_id:
         return empty
 
+    # Try DB first — avoids a live API call per fixture pair (major speed-up for backtesting)
+    try:
+        from bets.models import HistoricalFixture
+        from django.db.models import Q
+        db_h2h = list(HistoricalFixture.objects.filter(
+            Q(home_team_id=home_team_id, away_team_id=away_team_id) |
+            Q(home_team_id=away_team_id, away_team_id=home_team_id),
+            home_score__isnull=False,
+        ).order_by("-match_date").values(
+            "home_team_id", "home_score", "away_score", "match_date"
+        )[:5])
+        if db_h2h:
+            home_blanks = away_blanks = 0
+            total_goals_list = []
+            last_date = last_score = None
+            for i, m in enumerate(db_h2h):
+                is_home = m["home_team_id"] == home_team_id
+                hg = m["home_score"] if is_home else m["away_score"]
+                ag = m["away_score"] if is_home else m["home_score"]
+                total_goals_list.append(hg + ag)
+                if hg == 0: home_blanks += 1
+                if ag == 0: away_blanks += 1
+                if i == 0:
+                    last_date = str(m["match_date"])
+                    last_score = f"{hg}-{ag}"
+            m0 = db_h2h[0]
+            is_home0 = m0["home_team_id"] == home_team_id
+            h_last = m0["home_score"] if is_home0 else m0["away_score"]
+            n = len(db_h2h)
+            result = {
+                "home_scored_last_h2h": h_last > 0,
+                "home_blanked_h2h": home_blanks,
+                "away_scored_last_h2h": True,
+                "away_blanked_h2h": away_blanks,
+                "h2h_avg_goals": round(sum(total_goals_list) / n, 2),
+                "h2h_low_scoring_count": sum(1 for g in total_goals_list if g <= 1),
+                "h2h_count": n,
+                "last_h2h_date": last_date,
+                "last_h2h_score": last_score,
+            }
+            _h2h_cache[key] = (now, result)
+            return result
+    except Exception:
+        pass
+
     try:
         # Fetch more matches and filter client-side to get up to 5 true H2H meetings
         resp = requests.get(
@@ -1696,6 +1815,324 @@ def _get_team_match_rates(team_id: int, limit: int = 20) -> dict:
     return result
 
 
+# ── DB-backed team stats (used when historical data is available) ─────────────
+
+_db_standings_cache: dict = {}
+
+def _get_league_standings_from_db(competition_code: str, season: int, before_date: str) -> dict:
+    """
+    Compute league standings from HistoricalFixture for all teams in a league,
+    using only matches played before before_date.
+    Returns {team_id: {"position": int, "points": int, "played": int,
+                        "goals_for": int, "goals_against": int,
+                        "home": {...}, "away": {...}}}
+    Results are cached per (competition_code, season, before_date) — safe because
+    historical match results are immutable.
+    """
+    cache_key = (competition_code, season, before_date)
+    if cache_key in _db_standings_cache:
+        return _db_standings_cache[cache_key]
+
+    from bets.models import HistoricalFixture
+
+    fixtures = list(HistoricalFixture.objects.filter(
+        league_code=competition_code,
+        season=season,
+        match_date__lt=before_date,
+        home_score__isnull=False,
+        away_score__isnull=False,
+    ).values("home_team_id", "away_team_id", "home_score", "away_score"))
+
+    if not fixtures:
+        return {}
+
+    teams: dict = {}
+
+    def _team(tid):
+        if tid not in teams:
+            teams[tid] = {
+                "points": 0, "played": 0, "won": 0, "drawn": 0, "lost": 0,
+                "goals_for": 0, "goals_against": 0,
+                "home": {"played": 0, "won": 0, "drawn": 0, "lost": 0,
+                         "goals_for": 0, "goals_against": 0},
+                "away": {"played": 0, "won": 0, "drawn": 0, "lost": 0,
+                         "goals_for": 0, "goals_against": 0},
+            }
+        return teams[tid]
+
+    for f in fixtures:
+        htid = f["home_team_id"]
+        atid = f["away_team_id"]
+        hs   = f["home_score"]
+        as_  = f["away_score"]
+        if not htid or not atid:
+            continue
+
+        ht = _team(htid)
+        at = _team(atid)
+
+        # Overall
+        ht["played"] += 1; at["played"] += 1
+        ht["goals_for"] += hs; ht["goals_against"] += as_
+        at["goals_for"] += as_; at["goals_against"] += hs
+
+        # Home record
+        ht["home"]["played"] += 1
+        ht["home"]["goals_for"] += hs; ht["home"]["goals_against"] += as_
+
+        # Away record
+        at["away"]["played"] += 1
+        at["away"]["goals_for"] += as_; at["away"]["goals_against"] += hs
+
+        # Points
+        if hs > as_:
+            ht["points"] += 3; ht["won"] += 1
+            ht["home"]["won"] += 1
+            at["lost"] += 1; at["away"]["lost"] += 1
+        elif hs < as_:
+            at["points"] += 3; at["won"] += 1
+            at["away"]["won"] += 1
+            ht["lost"] += 1; ht["home"]["lost"] += 1
+        else:
+            ht["points"] += 1; ht["drawn"] += 1; ht["home"]["drawn"] += 1
+            at["points"] += 1; at["drawn"] += 1; at["away"]["drawn"] += 1
+
+    # Sort by points (then goal diff) to assign positions
+    ranked = sorted(teams.items(),
+                    key=lambda x: (x[1]["points"],
+                                   x[1]["goals_for"] - x[1]["goals_against"]),
+                    reverse=True)
+    for pos, (tid, data) in enumerate(ranked, 1):
+        data["position"] = pos
+
+    _db_standings_cache[cache_key] = teams
+    return teams
+
+
+def _get_team_stats_from_db(
+    team_id: int,
+    team_name: str,
+    competition_code: str,
+    match_date_str: str,
+    season: int = 2025,
+) -> dict | None:
+    """
+    Compute the same stats dict as get_team_season_stats() but entirely from
+    the local HistoricalFixture + MatchStats + MatchUnderstatStats tables.
+    Returns None if there are fewer than 4 completed matches in the DB for
+    this team/league (not enough to compute meaningful stats).
+    """
+    from bets.models import HistoricalFixture, MatchStats, MatchUnderstatStats
+    from django.db.models import Q, Avg, Sum
+
+    # All completed fixtures for this team in this league before the match date
+    qs = HistoricalFixture.objects.filter(
+        Q(home_team_id=team_id) | Q(away_team_id=team_id),
+        league_code=competition_code,
+        season=season,
+        match_date__lt=match_date_str,
+        home_score__isnull=False,
+        away_score__isnull=False,
+    ).order_by("-match_date")
+
+    matches = list(qs.values(
+        "id", "home_team_id", "away_team_id", "home_score", "away_score", "match_date"
+    ))
+
+    if len(matches) < 1:
+        return None
+
+    # ── Compute match-level rates ─────────────────────────────────────────────
+    btts = over15 = over25 = over35 = cs = 0
+    h_cs = h_games = h_blanks = 0
+    a_cs = a_games = 0
+    h_scored = h_conceded = 0
+    a_scored = a_conceded = 0
+    total_gf = total_ga = 0
+    gf_series = []   # ordered most-recent first
+    ga_series = []
+
+    for m in matches:
+        is_home = m["home_team_id"] == team_id
+        gf = m["home_score"] if is_home else m["away_score"]
+        ga = m["away_score"] if is_home else m["home_score"]
+        tg = m["home_score"] + m["away_score"]
+
+        gf_series.append(gf); ga_series.append(ga)
+        total_gf += gf; total_ga += ga
+
+        if gf > 0 and ga > 0: btts += 1
+        if tg >= 2: over15 += 1
+        if tg >= 3: over25 += 1
+        if tg >= 4: over35 += 1
+        if ga == 0: cs += 1
+
+        if is_home:
+            h_games += 1; h_scored += gf; h_conceded += ga
+            if ga == 0: h_cs += 1
+            if gf == 0: h_blanks += 1
+        else:
+            a_games += 1; a_scored += gf; a_conceded += ga
+            if ga == 0: a_cs += 1
+
+    n = len(matches)
+    _r  = lambda x: round(x / n, 3)
+    _hv = lambda x, g: round(x / g, 3) if g else None
+    _pg = lambda x: round(x / n, 2)
+
+    # ── xG from MatchStats (API-Football) ────────────────────────────────────
+    fixture_ids = [m["id"] for m in matches]
+    ms_rows = list(MatchStats.objects.filter(
+        fixture_id__in=fixture_ids,
+        xg_home__isnull=False,
+    ).values("fixture_id", "xg_home", "xg_away", "yellow_home", "yellow_away"))
+
+    ms_by_fid = {r["fixture_id"]: r for r in ms_rows}
+
+    xg_total = xga_total = 0.0
+    h_xg_total = h_xga_total = 0
+    a_xg_total = a_xga_total = 0
+    h_xg_games = a_xg_games = 0
+    yellow_total = 0; yellow_games = 0
+
+    for m in matches:
+        ms = ms_by_fid.get(m["id"])
+        if ms and ms["xg_home"] is not None:
+            is_home = m["home_team_id"] == team_id
+            xg  = ms["xg_home"] if is_home else ms["xg_away"]
+            xga = ms["xg_away"] if is_home else ms["xg_home"]
+            xg_total += xg; xga_total += xga
+            if is_home:
+                h_xg_total += xg; h_xga_total += xga; h_xg_games += 1
+            else:
+                a_xg_total += xg; a_xga_total += xga; a_xg_games += 1
+        if ms:
+            yel = ms["yellow_home"] if m["home_team_id"] == team_id else ms["yellow_away"]
+            if yel is not None:
+                yellow_total += yel; yellow_games += 1
+
+    xg_games = h_xg_games + a_xg_games
+    xg_per_game  = round(xg_total  / xg_games, 2) if xg_games else round(total_gf / n * 1.15, 2)
+    xga_per_game = round(xga_total / xg_games, 2) if xg_games else round(total_ga / n * 1.15, 2)
+    home_xg_pg   = round(h_xg_total  / h_xg_games, 2) if h_xg_games else None
+    away_xg_pg   = round(a_xg_total  / a_xg_games, 2) if a_xg_games else None
+    home_xga_pg  = round(h_xga_total / h_xg_games, 2) if h_xg_games else None
+    away_xga_pg  = round(a_xga_total / a_xg_games, 2) if a_xg_games else None
+
+    yellow_cards_pg = round(yellow_total / yellow_games, 2) if yellow_games else None
+
+    # ── Understat xG override for Big 5 leagues ───────────────────────────────
+    _UNDERSTAT_CODES = {"PL", "PD", "BL1", "SA", "FL1"}
+    if competition_code in _UNDERSTAT_CODES:
+        us_rows = list(MatchUnderstatStats.objects.filter(
+            fixture_id__in=fixture_ids,
+        ).values("fixture_id", "xg_open_play_home", "xg_open_play_away",
+                 "xg_set_piece_home", "xg_set_piece_away",
+                 "xg_penalty_home", "xg_penalty_away"))
+
+        us_by_fid = {}
+        for r in us_rows:
+            # Sum all xG components
+            def _s(*keys): return sum((r.get(k) or 0) for k in keys)
+            us_by_fid[r["fixture_id"]] = {
+                "xg_h": _s("xg_open_play_home","xg_set_piece_home","xg_penalty_home"),
+                "xg_a": _s("xg_open_play_away","xg_set_piece_away","xg_penalty_away"),
+            }
+
+        u_xg = u_xga = 0.0; u_n = 0
+        u_h_xg = u_h_n = 0.0
+        u_a_xg = u_a_n = 0.0
+        for m in matches:
+            us = us_by_fid.get(m["id"])
+            if not us:
+                continue
+            is_home = m["home_team_id"] == team_id
+            xg  = us["xg_h"] if is_home else us["xg_a"]
+            xga = us["xg_a"] if is_home else us["xg_h"]
+            u_xg += xg; u_xga += xga; u_n += 1
+            if is_home: u_h_xg += xg; u_h_n += 1
+            else:       u_a_xg += xg; u_a_n += 1
+
+        if u_n >= 3:
+            xg_per_game  = round(u_xg  / u_n, 2)
+            xga_per_game = round(u_xga / u_n, 2)
+            if u_h_n: home_xg_pg  = round(u_h_xg / u_h_n, 2)
+            if u_a_n: away_xg_pg  = round(u_a_xg / u_a_n, 2)
+
+    # ── Standings ─────────────────────────────────────────────────────────────
+    all_standings = _get_league_standings_from_db(competition_code, season, match_date_str)
+    standing = all_standings.get(team_id, {})
+    home_rec = standing.get("home", {})
+    away_rec = standing.get("away", {})
+
+    # ── Assemble result (same shape as get_team_season_stats) ─────────────────
+    gf_total = standing.get("goals_for", total_gf)
+    ga_total = standing.get("goals_against", total_ga)
+    played   = standing.get("played", n) or 1
+
+    result = {
+        "team_id":   team_id,
+        "team_name": team_name,
+
+        "position":         standing.get("position"),
+        "points":           standing.get("points"),
+        "played":           played,
+        "goals_for_pg":     round(gf_total / played, 2),
+        "goals_against_pg": round(ga_total / played, 2),
+
+        "home": home_rec,
+        "away": away_rec,
+
+        "xg_per_game":      xg_per_game,
+        "xga_per_game":     xga_per_game,
+        "ppda_avg":         None,   # not stored in DB yet
+        "scored_per_game":  _pg(total_gf),
+        "missed_per_game":  _pg(total_ga),
+        "clean_sheet_rate": _r(cs),
+        "btts_rate":        _r(btts),
+        "over25_rate":      _r(over25),
+        "over15_rate":      _r(over15),
+        "over35_rate":      _r(over35),
+
+        "home_xg_pg":   home_xg_pg,
+        "home_xga_pg":  home_xga_pg,
+        "home_cs_rate": _hv(h_cs, h_games),
+        "away_xg_pg":   away_xg_pg,
+        "away_xga_pg":  away_xga_pg,
+        "away_cs_rate": _hv(a_cs, a_games),
+
+        "scored_last3": sum(1 for g in gf_series[:3] if g > 0),
+        "scored_last5": sum(1 for g in gf_series[:5] if g > 0),
+        "cs_last3":     sum(1 for g in ga_series[:3] if g == 0),
+        "cs_last5":     sum(1 for g in ga_series[:5] if g == 0),
+        "home_blank_rate": _hv(h_blanks, h_games),
+
+        "yellow_cards_pg": yellow_cards_pg,
+        "competition_code": competition_code,
+    }
+
+    # xG overperformance ratio
+    _gf_pg = result.get("goals_for_pg") or 0
+    _xg_pg = result.get("xg_per_game") or 0
+    if _xg_pg > 0.3 and _gf_pg > 0:
+        result["xg_overperform_ratio"] = round(_gf_pg / _xg_pg, 3)
+    else:
+        result["xg_overperform_ratio"] = None
+
+    # Apply xG discount for known inflationary leagues
+    xg_factor = _XG_LEAGUE_FACTORS.get(competition_code, 1.0)
+    if xg_factor < 1.0:
+        for key in ("xg_per_game","home_xg_pg","away_xg_pg","scored_per_game","goals_for_pg"):
+            if result.get(key) is not None:
+                result[key] = round(result[key] * xg_factor, 3)
+        for key in ("btts_rate","over25_rate","over35_rate","over15_rate"):
+            if result.get(key) is not None:
+                result[key] = round(result[key] * xg_factor, 3)
+        result["_xg_discount"] = xg_factor
+
+    return result
+
+
 # ── Team season stats (combined aggregator) ───────────────────────────────────
 _season_stats_cache: dict = {}
 _SEASON_STATS_TTL = 6 * 3600
@@ -1723,6 +2160,22 @@ def get_team_season_stats(
         ts, data = cached
         if now - ts < _SEASON_STATS_TTL:
             return data
+
+    # ── Try DB-backed stats first (historical dates / backtest mode) ──────────
+    if team_id:
+        try:
+            db_result = _get_team_stats_from_db(
+                team_id=team_id,
+                team_name=team_name,
+                competition_code=competition_code,
+                match_date_str=match_date,
+                season=2025,
+            )
+            if db_result is not None:
+                _season_stats_cache[cache_key] = (now, db_result)
+                return db_result
+        except Exception:
+            pass  # fall through to live API
 
     # ── 1. Standings ──────────────────────────────────────────────────────────
     standings = _get_standings(competition_code)

@@ -74,37 +74,43 @@ class Command(BaseCommand):
         print(f"{DIV}\n")
         print(f"  Analysing matches, please wait...\n")
 
-        # Quick connectivity check — detects network failure vs genuinely no matches
+        # Skip connectivity ping for historical dates — DB handles those directly.
+        # Only ping the API for today/future dates (live predictions).
         import time as _time
         import requests as _req
         from django.conf import settings as _cfg
-        try:
-            _ping = _req.get(
-                "https://api.football-data.org/v4/competitions/PL/matches",
-                headers={"X-Auth-Token": _cfg.FOOTBALL_DATA_API_KEY},
-                params={"dateFrom": target_date, "dateTo": target_date},
-                timeout=12,
-            )
-            # Auto-retry once on rate limit (handles back-to-back batch runs)
-            if _ping.status_code == 429:
-                print(f"  Rate limit hit — waiting 65s and retrying...")
-                _time.sleep(65)
+        from datetime import date as _date_cls
+        _is_historical = _date_cls.fromisoformat(target_date) < _date_cls.today()
+        if not _is_historical:
+            try:
                 _ping = _req.get(
                     "https://api.football-data.org/v4/competitions/PL/matches",
                     headers={"X-Auth-Token": _cfg.FOOTBALL_DATA_API_KEY},
                     params={"dateFrom": target_date, "dateTo": target_date},
                     timeout=12,
                 )
-            _ping_matches = len(_ping.json().get("matches", [])) if _ping.status_code == 200 else 0
-            print(f"  API connection: OK (status {_ping.status_code}, {_ping_matches} PL matches on {target_date})")
-            if _ping.status_code == 401:
-                print(f"  ERROR: Invalid API key — check FOOTBALL_DATA_API_KEY in your .env")
-                return
-            if _ping.status_code == 429:
-                print(f"  ERROR: API rate limit still active — please wait a minute before retrying.")
-                return
-        except Exception as _e:
-            print(f"  [Warning] Connectivity ping failed ({type(_e).__name__}) — continuing anyway.")
+                # Auto-retry once on rate limit (handles back-to-back batch runs)
+                if _ping.status_code == 429:
+                    print(f"  Rate limit hit — waiting 65s and retrying...")
+                    _time.sleep(65)
+                    _ping = _req.get(
+                        "https://api.football-data.org/v4/competitions/PL/matches",
+                        headers={"X-Auth-Token": _cfg.FOOTBALL_DATA_API_KEY},
+                        params={"dateFrom": target_date, "dateTo": target_date},
+                        timeout=12,
+                    )
+                _ping_matches = len(_ping.json().get("matches", [])) if _ping.status_code == 200 else 0
+                print(f"  API connection: OK (status {_ping.status_code}, {_ping_matches} PL matches on {target_date})")
+                if _ping.status_code == 401:
+                    print(f"  ERROR: Invalid API key — check FOOTBALL_DATA_API_KEY in your .env")
+                    return
+                if _ping.status_code == 429:
+                    print(f"  ERROR: API rate limit still active — please wait a minute before retrying.")
+                    return
+            except Exception as _e:
+                print(f"  [Warning] Connectivity ping failed ({type(_e).__name__}) — continuing anyway.")
+        else:
+            print(f"  [DB mode] Historical date — using local database (no API calls)")
 
         try:
             fixtures = get_fixtures_by_date(target_date)
@@ -160,8 +166,9 @@ class Command(BaseCommand):
                 if not home_stats or not away_stats:
                     continue
 
-                home_ctx = get_team_context(home_stats.get("team_id", 0), comp_code)
-                away_ctx = get_team_context(away_stats.get("team_id", 0), comp_code)
+                _ctx_date = target_date if _is_historical else None
+                home_ctx = get_team_context(home_stats.get("team_id", 0), comp_code, _ctx_date)
+                away_ctx = get_team_context(away_stats.get("team_id", 0), comp_code, _ctx_date)
 
                 # H2H check — penalise if team failed to score vs this opponent recently
                 h2h = get_h2h_scored(
