@@ -365,11 +365,12 @@ _fixtures_date_cache: dict = {}
 _FIXTURES_DATE_TTL = 5 * 60  # 5 minutes — keeps live scores fresh
 
 
-def _fetch_competition_for_date(code: str, date_str: str) -> tuple[list[dict], bool]:
+def _fetch_competition_for_date(code: str, date_str: str) -> tuple[list[dict], bool, bool]:
     """
     Fetch matches for one competition on one date.
-    Returns (results, had_network_error).
-    had_network_error=True means the request never completed (timeout/DNS/etc).
+    Returns (results, had_network_error, was_rate_limited).
+    had_network_error=True  → request never completed (timeout/DNS/etc)
+    was_rate_limited=True   → API returned 429 (quota exhausted)
     """
     try:
         resp = requests.get(
@@ -378,8 +379,10 @@ def _fetch_competition_for_date(code: str, date_str: str) -> tuple[list[dict], b
             params={"dateFrom": date_str, "dateTo": date_str},
             timeout=10,
         )
+        if resp.status_code == 429:
+            return [], False, True  # Rate limited — not "no data"
         if resp.status_code not in (200, 206):
-            return [], False  # API responded but no data (e.g. 404 / 403)
+            return [], False, False  # Expected empty (404 / 403)
         body = resp.json()
         comp_obj = body.get("competition") or {}
         area_obj = body.get("area") or {}
@@ -390,9 +393,9 @@ def _fetch_competition_for_date(code: str, date_str: str) -> tuple[list[dict], b
             if "area" not in m:
                 m["area"] = area_obj
             results.append(_parse_match_row(m))
-        return results, False
+        return results, False, False
     except requests.RequestException:
-        return [], True  # Network failure
+        return [], True, False  # Network failure
 
 
 def get_fixtures_by_date(date_str: str) -> list[dict]:
@@ -414,6 +417,7 @@ def get_fixtures_by_date(date_str: str) -> list[dict]:
     all_matches: list[dict] = []
     seen_ids: set = set()
     error_count = 0
+    rate_limit_count = 0
     success_count = 0
 
     # Fetch all competitions concurrently — advanced tier handles the load fine.
@@ -422,9 +426,11 @@ def get_fixtures_by_date(date_str: str) -> list[dict]:
         futures = {pool.submit(_fetch_competition_for_date, code, date_str): code
                    for code in codes}
         for future in concurrent.futures.as_completed(futures):
-            matches, had_error = future.result()
+            matches, had_error, was_rate_limited = future.result()
             if had_error:
                 error_count += 1
+            elif was_rate_limited:
+                rate_limit_count += 1
             else:
                 success_count += 1
             for m in matches:
@@ -439,6 +445,25 @@ def get_fixtures_by_date(date_str: str) -> list[dict]:
         raise ConnectionError(
             f"api.football-data.org unreachable — all {error_count} requests timed out. "
             "Check your internet connection or VPN."
+        )
+
+    # If all (or most) requests were rate-limited with no successes, raise so
+    # callers get a clear error instead of silently treating it as "no matches".
+    if rate_limit_count > 0 and success_count == 0:
+        raise ConnectionError(
+            f"api.football-data.org rate limit hit — {rate_limit_count}/{len(codes)} "
+            "competition requests returned 429. Wait ~60 seconds and retry."
+        )
+
+    # Partial rate-limit: some competitions returned data, some were rate-limited.
+    # Don't raise — return what we have, but print a warning so the caller knows
+    # results may be incomplete for the rate-limited competitions.
+    if rate_limit_count > 0 and success_count > 0:
+        import warnings
+        warnings.warn(
+            f"[Rate limit] {rate_limit_count}/{len(codes)} competition requests returned 429 "
+            f"— results for those leagues may be missing. Got data from {success_count} league(s).",
+            RuntimeWarning, stacklevel=2,
         )
 
     _fixtures_date_cache[date_str] = (now, all_matches)
