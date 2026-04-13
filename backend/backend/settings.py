@@ -25,6 +25,7 @@ SECRET_KEY = config('SECRET_KEY')
 DEBUG = config('DEBUG', default=True, cast=bool)
 FOOTBALL_DATA_API_KEY = config('FOOTBALL_DATA_API_KEY')
 API_FOOTBALL_KEY = config('API_FOOTBALL_KEY', default='')
+ODDS_API_KEY     = config('ODDS_API_KEY', default='')
 
 ALLOWED_HOSTS = []
 

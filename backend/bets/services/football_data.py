@@ -453,7 +453,7 @@ def get_fixtures_by_date(date_str: str) -> list[dict]:
     from datetime import date as _date_cls
     try:
         _pred_date = _date_cls.fromisoformat(date_str)
-        if _pred_date < _date_cls.today():
+        if _pred_date <= _date_cls.today():
             db_fixtures = _get_fixtures_from_db(date_str)
             if db_fixtures is not None:
                 _fixtures_date_cache[date_str] = (now, db_fixtures)
@@ -1909,6 +1909,63 @@ def _get_league_standings_from_db(competition_code: str, season: int, before_dat
     return teams
 
 
+def key_player_absence_factor(team_name: str, match_date_str: str,
+                              n_recent: int = 3, min_goals: int = 5):
+    """
+    Check whether a team's top scorer has been absent from recent fixtures.
+
+    Returns (factor: float, warning: str | None)
+      factor = 0.82 if the player missed 2+ of the last n_recent games
+               1.0  otherwise
+    Calibrated against Galatasaray/Osimhen data: ~19% goal drop when absent.
+    """
+    try:
+        from bets.models import PlayerMatchRating, HistoricalFixture
+        from django.db.models import Sum, Q
+
+        # ── Find top scorer for this team this season ─────────────────────────
+        top = (
+            PlayerMatchRating.objects
+            .filter(team_name=team_name)
+            .values("player_name", "player_id")
+            .annotate(total_goals=Sum("goals"))
+            .order_by("-total_goals")
+            .first()
+        )
+        if not top or (top["total_goals"] or 0) < min_goals:
+            return 1.0, None  # no dominant scorer — no adjustment needed
+
+        player_name = top["player_name"]
+        player_id   = top["player_id"]
+
+        # ── Last n_recent completed fixtures for this team before match_date ──
+        recent = list(
+            HistoricalFixture.objects
+            .filter(
+                Q(home_team=team_name) | Q(away_team=team_name),
+                home_score__isnull=False,
+                match_date__lt=match_date_str,
+            )
+            .order_by("-match_date")[:n_recent]
+        )
+        if len(recent) < 2:
+            return 1.0, None
+
+        absent = sum(
+            1 for fx in recent
+            if not PlayerMatchRating.objects.filter(
+                fixture=fx, player_id=player_id, minutes_played__gt=0
+            ).exists()
+        )
+
+        if absent >= 2:
+            return 0.82, f"⚠ {player_name} absent {absent}/{len(recent)} recent games"
+
+        return 1.0, None
+    except Exception:
+        return 1.0, None
+
+
 def _get_team_stats_from_db(
     team_id: int,
     team_name: str,
@@ -1926,6 +1983,8 @@ def _get_team_stats_from_db(
     from django.db.models import Q, Avg, Sum
 
     # All completed fixtures for this team in this league before the match date
+    # Query current season first; if fewer than 5 matches, also pull previous
+    # season to give the model data at the very start of a new campaign.
     qs = HistoricalFixture.objects.filter(
         Q(home_team_id=team_id) | Q(away_team_id=team_id),
         league_code=competition_code,
@@ -1938,6 +1997,20 @@ def _get_team_stats_from_db(
     matches = list(qs.values(
         "id", "home_team_id", "away_team_id", "home_score", "away_score", "match_date"
     ))
+
+    # Not enough current-season data — supplement with previous season
+    if len(matches) < 5:
+        prev_qs = HistoricalFixture.objects.filter(
+            Q(home_team_id=team_id) | Q(away_team_id=team_id),
+            league_code=competition_code,
+            season=season - 1,
+            home_score__isnull=False,
+            away_score__isnull=False,
+        ).order_by("-match_date")[:30]  # last 30 matches of previous season
+        prev_matches = list(prev_qs.values(
+            "id", "home_team_id", "away_team_id", "home_score", "away_score", "match_date"
+        ))
+        matches = matches + prev_matches
 
     if len(matches) < 1:
         return None
