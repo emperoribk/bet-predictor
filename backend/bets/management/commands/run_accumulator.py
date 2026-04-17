@@ -279,6 +279,9 @@ class Command(BaseCommand):
             result = self._run_date(target_date, verbose=True, debug=options.get("debug", False))
             if not result:
                 self.stdout.write("  No qualifying picks today.\n")
+            else:
+                accumulator, combined, tier = result
+                self._save_to_db(target_date, accumulator, combined)
             # verbose output already printed inside _run_date
 
     # ── Backtest ──────────────────────────────────────────────────────────────
@@ -590,6 +593,44 @@ class Command(BaseCommand):
             self._print(target_date, accumulator, combined, tier, odds_api_key=odds_api_key)
 
         return accumulator, combined, tier
+
+    # ── Save to DB ────────────────────────────────────────────────────────────
+    def _save_to_db(self, target_date: str, accumulator: list, combined: float):
+        from bets.models import Prediction
+        from datetime import date as _dc
+        _day_map = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
+        _d  = _dc.fromisoformat(target_date)
+        dow = _day_map[_d.weekday()]
+        saved = 0
+        for pick in accumulator:
+            parts     = pick["fixture"].split(" vs ", 1)
+            home_team = parts[0].strip()
+            away_team = parts[1].strip() if len(parts) > 1 else ""
+            conf      = int(pick["probability"] * 100)
+            grade     = 'A+' if conf >= 84 else ('A' if conf >= 82 else ('B' if conf >= 80 else 'C'))
+            evidence  = [
+                pick.get("label", pick["market"]),
+                f"xG: {pick.get('h_xg','?')} vs {pick.get('a_xg','?')}",
+                f"Model odds: @{pick['odds']:.2f}",
+            ]
+            Prediction.objects.update_or_create(
+                match_date=_d,
+                home_team=home_team,
+                away_team=away_team,
+                bet_type=pick["market"],
+                defaults={
+                    "league":           pick["league"],
+                    "competition_code": pick["league"],
+                    "confidence":       conf,
+                    "grade":            grade,
+                    "grade_score":      conf,
+                    "evidence":         evidence,
+                    "day_of_week":      dow,
+                    "outcome":          "PENDING",
+                },
+            )
+            saved += 1
+        self.stdout.write(f"  Saved {saved} picks to DB for {target_date}.\n")
 
     # ── Print ─────────────────────────────────────────────────────────────────
     def _print(self, target_date, accumulator, combined, tier=1, odds_api_key=""):

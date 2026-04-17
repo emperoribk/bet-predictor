@@ -1,10 +1,10 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date as _date_cls, timedelta
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 
-from .models import BetSlip, Match
+from .models import BetSlip, Match, Prediction
 from .services.sportybet import decode_booking_code
 from .services.football_data import find_fixture_id, get_live_match, get_all_live_matches, get_todays_matches, get_match_detail, get_match_preview
 from .services.analysis import analyse_bet_slip
@@ -329,3 +329,55 @@ class FixtureBetSignalsView(APIView):
             "home_stats": home_stats,
             "away_stats": away_stats,
         })
+
+
+class UpcomingPicksView(APIView):
+    """
+    GET /api/predictions/upcoming/
+
+    Returns accumulator picks saved for the upcoming Friday, Saturday, and Sunday
+    (or today if today is a weekend day). Picks are saved by run_accumulator command.
+    """
+    def get(self, request):
+        today = _date_cls.today()
+
+        # Collect next 3 weekend days (Fri=4, Sat=5, Sun=6), including today if applicable
+        weekend_dates = []
+        for i in range(7):
+            d = today + timedelta(days=i)
+            if d.weekday() in (4, 5, 6):
+                weekend_dates.append(d)
+            if len(weekend_dates) == 3:
+                break
+
+        days = []
+        for d in weekend_dates:
+            picks_qs = Prediction.objects.filter(match_date=d).order_by('-confidence')
+            picks = []
+            combined = 1.0
+            for p in picks_qs:
+                bet_label = p.evidence[0] if p.evidence else p.bet_type
+                combined *= 1 / max(p.confidence / 100, 0.01)
+                picks.append({
+                    "id":               p.id,
+                    "home_team":        p.home_team,
+                    "away_team":        p.away_team,
+                    "fixture":          f"{p.home_team} vs {p.away_team}",
+                    "bet_type":         p.bet_type,
+                    "bet_label":        bet_label,
+                    "competition_code": p.competition_code,
+                    "confidence":       p.confidence,
+                    "grade":            p.grade,
+                    "evidence":         p.evidence,
+                    "outcome":          p.outcome,
+                    "match_date":       str(p.match_date),
+                })
+            days.append({
+                "day":          d.strftime('%A'),
+                "date":         str(d),
+                "date_display": f"{d.strftime('%a')} {d.day} {d.strftime('%b')}",
+                "picks":        picks,
+                "combined_odds": round(combined, 2) if picks else None,
+            })
+
+        return Response({"days": days})

@@ -2,7 +2,7 @@ from django.urls import path
 from .views import (
     DecodeBookingCodeView, LiveStatsView, GlobalLiveMatchesView,
     TodaysMatchesView, MatchDetailView, MatchPreviewView, MatchAssessmentView,
-    TodaysBestBetsView, FixtureBetSignalsView,
+    TodaysBestBetsView, FixtureBetSignalsView, UpcomingPicksView,
 )
 
 urlpatterns = [
@@ -14,5 +14,6 @@ urlpatterns = [
     path("match-preview/<int:fixture_id>/", MatchPreviewView.as_view(), name="match-preview"),
     path("match-assessment/<int:fixture_id>/", MatchAssessmentView.as_view(), name="match-assessment"),
     path("predictions/today/", TodaysBestBetsView.as_view(), name="predictions-today"),
+    path("predictions/upcoming/", UpcomingPicksView.as_view(), name="predictions-upcoming"),
     path("predictions/fixture/<int:fixture_id>/", FixtureBetSignalsView.as_view(), name="predictions-fixture"),
 ]

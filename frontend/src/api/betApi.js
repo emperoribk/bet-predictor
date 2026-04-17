@@ -1,7 +1,9 @@
 import axios from 'axios'
 
+// In production (Railway), set VITE_API_URL=https://your-backend.railway.app
+// In local dev, Vite proxy handles /api → localhost:8000
 const api = axios.create({
-  baseURL: '/api',
+  baseURL: import.meta.env.VITE_API_URL || '/api',
   headers: { 'Content-Type': 'application/json' },
 })
 
@@ -39,5 +41,10 @@ export const fetchMatchDetail = async (fixtureId) => {
 
 export const fetchMatchPreview = async (fixtureId) => {
   const { data } = await api.get(`/match-preview/${fixtureId}/`)
+  return data
+}
+
+export const fetchWeekendPicks = async () => {
+  const { data } = await api.get('/predictions/upcoming/')
   return data
 }

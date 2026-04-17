@@ -1,22 +1,15 @@
-import { Home, BookOpen, CalendarDays, User } from 'lucide-react'
+import { Home, BookOpen, CalendarDays, TrendingUp } from 'lucide-react'
 import { motion } from 'framer-motion'
-import { useToast } from './Toast'
 
 const tabs = [
-  { id: 'home',     label: 'Home',     Icon: Home },
-  { id: 'mybets',   label: 'My Bets',  Icon: BookOpen },
-  { id: 'fixtures', label: 'Fixtures', Icon: CalendarDays },
-  { id: 'profile',  label: 'Profile',  Icon: User },
+  { id: 'home',      label: 'Home',      Icon: Home },
+  { id: 'mybets',    label: 'My Bets',   Icon: BookOpen },
+  { id: 'fixtures',  label: 'Fixtures',  Icon: CalendarDays },
+  { id: 'betpicks',  label: 'Bet Picks', Icon: TrendingUp },
 ]
 
 export default function BottomNav({ active, onChange }) {
-  const toast = useToast()
-
   function handleTab(id) {
-    if (id === 'profile') {
-      toast('Coming soon!')
-      return
-    }
     onChange(id)
   }
 

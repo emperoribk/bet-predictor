@@ -7,6 +7,7 @@ import HomeScreen from './pages/HomeScreen'
 import MyBetsScreen from './pages/MyBetsScreen'
 import TrackerScreen from './pages/TrackerScreen'
 import FixturesScreen from './pages/LiveScreen'
+import BetPicksScreen from './pages/BetPicksScreen'
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } },
@@ -73,6 +74,17 @@ function Shell() {
             style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
           >
             <HomeScreen onTrack={handleTrack} onViewLive={() => setTab('fixtures')} />
+          </motion.div>
+        ) : tab === 'betpicks' ? (
+          <motion.div
+            key="betpicks"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
+          >
+            <BetPicksScreen />
           </motion.div>
         ) : (
           <motion.div
