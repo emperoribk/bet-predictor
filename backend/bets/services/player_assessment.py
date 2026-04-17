@@ -45,6 +45,12 @@ FD_POSITION_MAP = {
     "Left Midfield":      ("M",  True,  False),
     "Right Midfield":     ("M",  True,  False),
     "Left Winger":        ("M",  True,  False),
+
+
+
+
+
+    
     "Right Winger":       ("M",  True,  False),
     "Centre-Forward":     ("F",  False, False),
     "Second Striker":     ("F",  False, False),

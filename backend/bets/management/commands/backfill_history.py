@@ -32,7 +32,7 @@ from bets.models import HistoricalFixture, MatchStats, MatchLineup, PlayerMatchR
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-SEASON = 2025   # 2025/26 season
+SEASON = 2025   # default season (overridden by --season flag)
 
 LEAGUES = {
     "PL":   39,    # Premier League
@@ -122,9 +122,11 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--league",        type=str,  default=None,  help="Restrict to one league code e.g. PL")
+        parser.add_argument("--season",        type=int,  default=SEASON, help="Season start year e.g. 2024 for 2024/25")
         parser.add_argument("--skip-players",  action="store_true",      help="Skip player rating calls")
         parser.add_argument("--fixtures-only", action="store_true",      help="Only sync fixture list")
         parser.add_argument("--resume",        action="store_true",      help="Skip fully-fetched fixtures")
+        parser.add_argument("--reverse",       action="store_true",      help="Process deep data newest-first (most recent months first)")
 
     def handle(self, *args, **options):
         api_key = getattr(settings, "API_FOOTBALL_KEY", None)
@@ -135,10 +137,12 @@ class Command(BaseCommand):
             self.stderr.write("ERROR: API_FOOTBALL_KEY not found in settings or environment.")
             return
 
+        season        = options["season"]
         league_filter = options["league"]
         skip_players  = options["skip_players"]
         fixtures_only = options["fixtures_only"]
         resume        = options["resume"]
+        reverse       = options["reverse"]
 
         target_leagues = {k: v for k, v in LEAGUES.items()
                           if league_filter is None or k == league_filter}
@@ -148,7 +152,7 @@ class Command(BaseCommand):
             return
 
         self.stdout.write(f"\n{'='*65}")
-        self.stdout.write(f"  SPORTY HISTORY BACKFILL  |  Season {SEASON}/{SEASON+1}")
+        self.stdout.write(f"  SPORTY HISTORY BACKFILL  |  Season {season}/{season+1}")
         self.stdout.write(f"  Leagues: {', '.join(target_leagues)}")
         self.stdout.write(f"  Skip players: {skip_players}  |  Fixtures only: {fixtures_only}  |  Resume: {resume}")
         self.stdout.write(f"{'='*65}\n")
@@ -158,9 +162,9 @@ class Command(BaseCommand):
         for code, league_id in target_leagues.items():
 
             # ── Step 1: Fetch fixture list (skip if already fully done on resume) ──
-            already_in_db = HistoricalFixture.objects.filter(league_code=code, season=SEASON).count()
+            already_in_db = HistoricalFixture.objects.filter(league_code=code, season=season).count()
             pending_deep  = HistoricalFixture.objects.filter(
-                league_code=code, season=SEASON,
+                league_code=code, season=season,
                 stats_fetched=False
             ).count() if resume else 1  # if not resume, always re-fetch list
 
@@ -169,7 +173,7 @@ class Command(BaseCommand):
                 data = None
             else:
                 self.stdout.write(f"\n[{code}] Fetching fixture list...")
-                data = _api("fixtures", {"league": league_id, "season": SEASON}, api_key)
+                data = _api("fixtures", {"league": league_id, "season": season}, api_key)
                 time.sleep(DELAY)
 
             if data == "QUOTA_EXHAUSTED":
@@ -215,7 +219,7 @@ class Command(BaseCommand):
                             league_code=code,
                             league_id=league_id,
                             league_name=league_name,
-                            season=SEASON,
+                            season=season,
                             match_date=fd,
                             kickoff=fx["fixture"]["date"],
                             round=lge.get("round", ""),
@@ -242,7 +246,7 @@ class Command(BaseCommand):
                 continue
 
             # ── Step 2: Fetch deep data for each fixture ─────────────────────
-            qs = HistoricalFixture.objects.filter(league_code=code, season=SEASON)
+            qs = HistoricalFixture.objects.filter(league_code=code, season=season)
             if resume:
                 need_stats   = qs.filter(stats_fetched=False)
                 need_lineups = qs.filter(lineup_fetched=False)
@@ -255,7 +259,8 @@ class Command(BaseCommand):
             total_fx = qs.count()
             self.stdout.write(f"  Deep data: {need_stats.count()} stats  |  {need_lineups.count()} lineups  |  {need_players.count() if not skip_players else 'skipped'} players")
 
-            for idx, fixture in enumerate(qs.order_by('match_date'), 1):
+            order = '-match_date' if reverse else 'match_date'
+            for idx, fixture in enumerate(qs.order_by(order), 1):
                 _h = fixture.home_team[:18].encode('ascii', 'replace').decode()
                 _a = fixture.away_team[:18].encode('ascii', 'replace').decode()
                 prefix = f"  [{idx:>4}/{total_fx}] {fixture.match_date} {_h} v {_a}"

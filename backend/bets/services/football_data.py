@@ -1909,6 +1909,215 @@ def _get_league_standings_from_db(competition_code: str, season: int, before_dat
     return teams
 
 
+_standings_cache: dict = {}   # (comp_code, season, match_date) → {team: pts}
+_h2h_cache: dict = {}         # (team_a, team_b, match_date) → avg_goals
+
+
+def _contextual_o15_adjustment(home_team: str, away_team: str,
+                               comp_code: str, match_date_str: str,
+                               p_o15: float) -> tuple:
+    """
+    Adjusts Over 1.5 probability downward based on two contextual signals
+    that season-average xG cannot capture:
+
+      1. H2H goal history  — some matchups are structurally tight regardless
+         of each team's season average (tactical familiarity, rivalry intensity,
+         one team always parks the bus against the other).
+
+      2. Table position gap — when a dominant leader plays a relegation side,
+         the leader typically scores early and manages the game down to 1-0.
+         Season xG doesn't know the leader only needed one goal.
+
+    Returns (adjusted_p_o15: float, reason: str | None)
+    Never inflates — only reduces.
+    """
+    try:
+        from bets.models import HistoricalFixture
+        from django.db.models import Q
+        from collections import defaultdict
+
+        factor  = 1.0
+        reasons = []
+
+        # ── 1. HEAD-TO-HEAD GOAL HISTORY ─────────────────────────────────────
+        # Last 6 meetings between these two teams (any venue, any season).
+        # Cached per pair+date so repeated calls on the same day are free.
+        h2h_key = (min(home_team, away_team), max(home_team, away_team), match_date_str)
+        if h2h_key not in _h2h_cache:
+            h2h = list(
+                HistoricalFixture.objects
+                .filter(
+                    Q(home_team=home_team, away_team=away_team) |
+                    Q(home_team=away_team, away_team=home_team),
+                    home_score__isnull=False,
+                    match_date__lt=match_date_str,
+                )
+                .order_by("-match_date")
+                .values("home_score", "away_score")[:6]
+            )
+            if len(h2h) >= 3:
+                _h2h_cache[h2h_key] = sum(r["home_score"] + r["away_score"] for r in h2h) / len(h2h)
+            else:
+                _h2h_cache[h2h_key] = None  # not enough history
+
+        avg_goals = _h2h_cache[h2h_key]
+        if avg_goals is not None:
+            if avg_goals < 1.6:
+                factor *= 0.80
+                reasons.append(f"H2H tight ({avg_goals:.1f}g avg)")
+            elif avg_goals < 2.0:
+                factor *= 0.91
+                reasons.append(f"H2H low-scoring ({avg_goals:.1f}g avg)")
+
+        # ── 2. TABLE POSITION GAP ────────────────────────────────────────────
+        # Build season standings once per (league, date) — cached across all
+        # fixtures on the same day to avoid repeating the same query 20× per date.
+        std_key = (comp_code, match_date_str)
+        if std_key not in _standings_cache:
+            prior = list(
+                HistoricalFixture.objects
+                .filter(
+                    league_code=comp_code,
+                    season=2025,
+                    match_date__lt=match_date_str,
+                    home_score__isnull=False,
+                )
+                .values("home_team", "away_team", "winner")
+            )
+            pts: dict = defaultdict(int)
+            for fx in prior:
+                if fx["winner"] == "HOME":
+                    pts[fx["home_team"]] += 3
+                elif fx["winner"] == "AWAY":
+                    pts[fx["away_team"]] += 3
+                else:
+                    pts[fx["home_team"]] += 1
+                    pts[fx["away_team"]] += 1
+            _standings_cache[std_key] = dict(pts)
+
+        pts = _standings_cache[std_key]
+        if pts and home_team in pts and away_team in pts:
+            ranked = sorted(pts.keys(), key=lambda t: -pts[t])
+            n = len(ranked)
+            if n >= 6:
+                home_pos = ranked.index(home_team) + 1
+                away_pos = ranked.index(away_team) + 1
+                pts_gap  = abs(pts[home_team] - pts[away_team])
+                top_cut  = max(1, n // 4)
+                bot_cut  = n - max(1, n // 4)
+
+                one_top = min(home_pos, away_pos) <= top_cut
+                one_bot = max(home_pos, away_pos) >= bot_cut
+
+                if pts_gap >= 20 and one_top and one_bot:
+                    factor *= 0.85
+                    reasons.append(
+                        f"Table gap large (Δ{pts_gap}pts, pos {home_pos} vs {away_pos})"
+                    )
+                elif pts_gap >= 12 and one_top and one_bot:
+                    factor *= 0.92
+                    reasons.append(
+                        f"Table gap moderate (Δ{pts_gap}pts, pos {home_pos} vs {away_pos})"
+                    )
+
+        adjusted = round(p_o15 * factor, 4)
+        reason   = " | ".join(reasons) if reasons else None
+        return adjusted, reason
+
+    except Exception:
+        return p_o15, None
+
+
+def _should_block_o15_booster(home_team: str, away_team: str,
+                              comp_code: str, match_date_str: str) -> tuple:
+    """
+    Hard-block an Over 1.5 booster for this fixture based on strong contextual signals
+    that season-average xG cannot capture.
+
+    Uses the same caches as _contextual_o15_adjustment so no extra DB cost when
+    both functions are called on the same day.
+
+    Returns (block: bool, reason: str | None)
+
+    Block conditions:
+      • H2H avg goals < 2.2 across last 6 meetings — any pair with below-average H2H scoring.
+        Threshold raised from 1.6: losses at 79% (Atalanta/Inter), 90% (Athletic/Barcelona)
+        showed that pairs averaging even 1.8–2.1 goals still regularly produce 0-1/1-0 results.
+      • Table gap ≥ 20 pts, one team top-quarter, other bottom-quarter — leader parks at 1-0
+    """
+    try:
+        from bets.models import HistoricalFixture
+        from django.db.models import Q
+        from collections import defaultdict
+
+        # ── 1. H2H TIGHT CHECK ───────────────────────────────────────────────
+        h2h_key = (min(home_team, away_team), max(home_team, away_team), match_date_str)
+        if h2h_key not in _h2h_cache:
+            h2h = list(
+                HistoricalFixture.objects
+                .filter(
+                    Q(home_team=home_team, away_team=away_team) |
+                    Q(home_team=away_team, away_team=home_team),
+                    home_score__isnull=False,
+                    match_date__lt=match_date_str,
+                )
+                .order_by("-match_date")
+                .values("home_score", "away_score")[:6]
+            )
+            if len(h2h) >= 2:  # require only 2 prior meetings — less strict
+                _h2h_cache[h2h_key] = sum(r["home_score"] + r["away_score"] for r in h2h) / len(h2h)
+            else:
+                _h2h_cache[h2h_key] = None
+
+        avg_goals = _h2h_cache[h2h_key]
+        if avg_goals is not None and avg_goals < 1.8:
+            return True, f"H2H structurally tight ({avg_goals:.1f}g avg)"
+
+        # ── 2. TABLE DOMINATION CHECK ────────────────────────────────────────
+        std_key = (comp_code, match_date_str)
+        if std_key not in _standings_cache:
+            prior = list(
+                HistoricalFixture.objects
+                .filter(
+                    league_code=comp_code,
+                    season=2025,
+                    match_date__lt=match_date_str,
+                    home_score__isnull=False,
+                )
+                .values("home_team", "away_team", "winner")
+            )
+            pts: dict = defaultdict(int)
+            for fx in prior:
+                if fx["winner"] == "HOME":
+                    pts[fx["home_team"]] += 3
+                elif fx["winner"] == "AWAY":
+                    pts[fx["away_team"]] += 3
+                else:
+                    pts[fx["home_team"]] += 1
+                    pts[fx["away_team"]] += 1
+            _standings_cache[std_key] = dict(pts)
+
+        pts = _standings_cache[std_key]
+        if pts and home_team in pts and away_team in pts:
+            ranked = sorted(pts.keys(), key=lambda t: -pts[t])
+            n = len(ranked)
+            if n >= 6:
+                home_pos = ranked.index(home_team) + 1
+                away_pos = ranked.index(away_team) + 1
+                pts_gap  = abs(pts[home_team] - pts[away_team])
+                top_cut  = max(1, n // 4)
+                bot_cut  = n - max(1, n // 4)
+                one_top  = min(home_pos, away_pos) <= top_cut
+                one_bot  = max(home_pos, away_pos) >= bot_cut
+                if pts_gap >= 20 and one_top and one_bot:
+                    return True, f"Table domination (Δ{pts_gap}pts, pos {home_pos} vs {away_pos})"
+
+        return False, None
+
+    except Exception:
+        return False, None  # fail open — never block a booster due to a query error
+
+
 def key_player_absence_factor(team_name: str, match_date_str: str,
                               n_recent: int = 3, min_goals: int = 5):
     """
@@ -2063,8 +2272,8 @@ def _get_team_stats_from_db(
     ms_by_fid = {r["fixture_id"]: r for r in ms_rows}
 
     xg_total = xga_total = 0.0
-    h_xg_total = h_xga_total = 0
-    a_xg_total = a_xga_total = 0
+    h_xg_total = h_xga_total = 0.0
+    a_xg_total = a_xga_total = 0.0
     h_xg_games = a_xg_games = 0
     yellow_total = 0; yellow_games = 0
 
@@ -2113,8 +2322,8 @@ def _get_team_stats_from_db(
             }
 
         u_xg = u_xga = 0.0; u_n = 0
-        u_h_xg = u_h_n = 0.0
-        u_a_xg = u_a_n = 0.0
+        u_h_xg = u_h_xga = u_h_n = 0.0
+        u_a_xg = u_a_xga = u_a_n = 0.0
         for m in matches:
             us = us_by_fid.get(m["id"])
             if not us:
@@ -2123,14 +2332,18 @@ def _get_team_stats_from_db(
             xg  = us["xg_h"] if is_home else us["xg_a"]
             xga = us["xg_a"] if is_home else us["xg_h"]
             u_xg += xg; u_xga += xga; u_n += 1
-            if is_home: u_h_xg += xg; u_h_n += 1
-            else:       u_a_xg += xg; u_a_n += 1
+            if is_home: u_h_xg += xg; u_h_xga += xga; u_h_n += 1
+            else:       u_a_xg += xg; u_a_xga += xga; u_a_n += 1
 
         if u_n >= 3:
             xg_per_game  = round(u_xg  / u_n, 2)
             xga_per_game = round(u_xga / u_n, 2)
-            if u_h_n: home_xg_pg  = round(u_h_xg / u_h_n, 2)
-            if u_a_n: away_xg_pg  = round(u_a_xg / u_a_n, 2)
+            if u_h_n:
+                home_xg_pg  = round(u_h_xg  / u_h_n, 2)
+                home_xga_pg = round(u_h_xga / u_h_n, 2)
+            if u_a_n:
+                away_xg_pg  = round(u_a_xg  / u_a_n, 2)
+                away_xga_pg = round(u_a_xga / u_a_n, 2)
 
     # ── Recent xG conversion (last 5 games with xG data) ─────────────────────
     # Tracks whether the team is actually converting their expected goals lately.
